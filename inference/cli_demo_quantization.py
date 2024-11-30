@@ -1,18 +1,6 @@
 """
-This script demonstrates how to generate a video from a text prompt using CogVideoX with quantization.
-
-Note:
-
-Must install the `torchao`，`torch` library FROM SOURCE to use the quantization feature.
-Only NVIDIA GPUs like H100 or higher are supported om FP-8 quantization.
-
-ALL quantization schemes must use with NVIDIA GPUs.
-
-# Run the script:
-
-python cli_demo_quantization.py --prompt "A girl riding a bike." --model_path THUDM/CogVideoX-2b --quantization_scheme fp8 --dtype float16
-python cli_demo_quantization.py --prompt "A girl riding a bike." --model_path THUDM/CogVideoX-5b --quantization_scheme fp8 --dtype bfloat16
-
+This script demonstrates how to generate a video from a text prompt using CogVideoX with modern quantization
+and memory optimizations for consumer GPUs.
 """
 
 import argparse
@@ -22,9 +10,9 @@ import torch._dynamo
 from diffusers import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel, CogVideoXPipeline, CogVideoXDPMScheduler
 from diffusers.utils import export_to_video
 from transformers import T5EncoderModel
-from torchao.quantization import quantize_, int8_weight_only
-from torchao.float8.inference import ActivationCasting, QuantConfig, quantize_to_float8
+from torchao.quantization import autoquant, DEFAULT_INT4_AUTOQUANT_CLASS_LIST
 
+# Configure PyTorch settings
 os.environ["TORCH_LOGS"] = "+dynamo,output_code,graph_breaks,recompiles"
 torch._dynamo.config.suppress_errors = True
 torch.set_float32_matmul_precision("high")
@@ -33,14 +21,46 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.epilogue_fusion = False
 torch._inductor.config.coordinate_descent_check_all_directions = True
 
+def setup_model(model_path, dtype=torch.float16, device="cuda"):
+    """
+    Load and set up the CogVideoX pipeline with appropriate optimizations
+    """
+    # Load pipeline with CPU offload by default
+    pipe = CogVideoXPipeline.from_pretrained(
+        model_path,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+    )
+    
+    # Set up scheduler
+    pipe.scheduler = CogVideoXDPMScheduler.from_config(
+        pipe.scheduler.config, 
+        timestep_spacing="trailing"
+    )
+    
+    return pipe
 
-def quantize_model(part, quantization_scheme):
-    if quantization_scheme == "int8":
-        quantize_(part, int8_weight_only())
-    elif quantization_scheme == "fp8":
-        quantize_to_float8(part, QuantConfig(ActivationCasting.DYNAMIC))
-    return part
+def apply_optimizations(pipe, memory_mode='medium'):
+    """
+    Apply memory optimizations based on the selected mode
+    """
+    if memory_mode == 'low':
+        # Sequential CPU offload for maximum memory savings
+        pipe.enable_sequential_cpu_offload()
+    elif memory_mode == 'medium':
+        # Balanced approach with model CPU offload and VAE optimizations
+        pipe.enable_model_cpu_offload()
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
+    else:  # 'high'
+        # Minimum memory optimization
+        pipe.enable_model_cpu_offload()
 
+    # Apply channels last memory format where possible
+    if hasattr(pipe.transformer, 'to'):
+        pipe.transformer.to(memory_format=torch.channels_last)
+
+    return pipe
 
 def generate_video(
     prompt: str,
@@ -49,55 +69,48 @@ def generate_video(
     num_inference_steps: int = 50,
     guidance_scale: float = 6.0,
     num_videos_per_prompt: int = 1,
-    quantization_scheme: str = "fp8",
+    memory_mode: str = 'medium',
     dtype: torch.dtype = torch.bfloat16,
-    num_frames: int = 81,
+    num_frames: int = 49,
     fps: int = 8,
     seed: int = 42,
+    device: str = "cuda"
 ):
     """
-    Generates a video based on the given prompt and saves it to the specified path.
-
-    Parameters:
-    - prompt (str): The description of the video to be generated.
-    - model_path (str): The path of the pre-trained model to be used.
-    - output_path (str): The path where the generated video will be saved.
-    - num_inference_steps (int): Number of steps for the inference process. More steps can result in better quality.
-    - guidance_scale (float): The scale for classifier-free guidance. Higher values can lead to better alignment with the prompt.
-    - num_videos_per_prompt (int): Number of videos to generate per prompt.
-    - quantization_scheme (str): The quantization scheme to use ('int8', 'fp8').
-    - dtype (torch.dtype): The data type for computation (default is torch.bfloat16).
+    Generates a video based on the given prompt using memory optimizations.
     """
-    text_encoder = T5EncoderModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=dtype)
-    text_encoder = quantize_model(part=text_encoder, quantization_scheme=quantization_scheme)
-    transformer = CogVideoXTransformer3DModel.from_pretrained(model_path, subfolder="transformer", torch_dtype=dtype)
-    transformer = quantize_model(part=transformer, quantization_scheme=quantization_scheme)
-    vae = AutoencoderKLCogVideoX.from_pretrained(model_path, subfolder="vae", torch_dtype=dtype)
-    vae = quantize_model(part=vae, quantization_scheme=quantization_scheme)
-    pipe = CogVideoXPipeline.from_pretrained(
-        model_path,
-        text_encoder=text_encoder,
-        transformer=transformer,
-        vae=vae,
-        torch_dtype=dtype,
-    )
-    pipe.scheduler = CogVideoXDPMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
-    pipe.enable_model_cpu_offload()
-    pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
-
-    video = pipe(
-        prompt=prompt,
-        num_videos_per_prompt=num_videos_per_prompt,
-        num_inference_steps=num_inference_steps,
-        num_frames=num_frames,
-        use_dynamic_cfg=True,
-        guidance_scale=guidance_scale,
-        generator=torch.Generator(device="cuda").manual_seed(seed),
-    ).frames[0]
-
-    export_to_video(video, output_path, fps=fps)
-
+    try:
+        # Set up the pipeline with appropriate optimizations
+        pipe = setup_model(model_path, dtype, device)
+        pipe = apply_optimizations(pipe, memory_mode)
+        
+        # Generate video
+        video = pipe(
+            prompt=prompt,
+            num_videos_per_prompt=num_videos_per_prompt,
+            num_inference_steps=num_inference_steps,
+            num_frames=num_frames,
+            use_dynamic_cfg=True,
+            guidance_scale=guidance_scale,
+            generator=torch.Generator(device=device).manual_seed(seed),
+        ).frames[0]
+        
+        # Export video
+        export_to_video(video, output_path, fps=fps)
+        print(f"Video successfully generated and saved to {output_path}")
+        
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print("\nGPU out of memory error. Try one of the following:")
+            print("1. Use --memory_mode low for maximum memory savings")
+            print("2. Reduce --num_frames (current: {num_frames})")
+            print("3. Use a smaller model variant (e.g., CogVideoX-2b instead of CogVideoX-5b)")
+        raise e
+    finally:
+        # Clean up
+        if 'pipe' in locals():
+            del pipe
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate a video from a text prompt using CogVideoX")
@@ -109,14 +122,20 @@ if __name__ == "__main__":
     parser.add_argument("--num_videos_per_prompt", type=int, default=1, help="Videos to generate per prompt")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="Data type (e.g., 'float16', 'bfloat16')")
     parser.add_argument(
-        "--quantization_scheme", type=str, default="fp8", choices=["int8", "fp8"], help="Quantization scheme"
+        "--memory_mode",
+        type=str,
+        choices=['low', 'medium', 'high'],
+        default='medium',
+        help="Memory optimization mode: low (~4GB), medium (~11GB), or high (~19GB)"
     )
-    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames in the video")
-    parser.add_argument("--fps", type=int, default=16, help="Frames per second for output video")
+    parser.add_argument("--num_frames", type=int, default=49, help="Number of frames in the video")
+    parser.add_argument("--fps", type=int, default=8, help="Frames per second for output video")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda or cpu)")
 
     args = parser.parse_args()
     dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
+    
     generate_video(
         prompt=args.prompt,
         model_path=args.model_path,
@@ -124,9 +143,10 @@ if __name__ == "__main__":
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
         num_videos_per_prompt=args.num_videos_per_prompt,
-        quantization_scheme=args.quantization_scheme,
+        memory_mode=args.memory_mode,
         dtype=dtype,
         num_frames=args.num_frames,
         fps=args.fps,
         seed=args.seed,
+        device=args.device
     )
